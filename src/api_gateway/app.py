@@ -555,6 +555,13 @@ def query(req: QueryRequest, ioc_type: str | None = None, incident_type: str | N
             SearchRequest(query=req.query, k=req.k).model_dump()
         )
     except Exception as e:
+        msg = str(e)
+        # Friendly fallback when the Chroma collection is missing in the search service
+        if "InvalidCollectionException" in msg or "does not exist" in msg:
+            return QueryResponse(
+                answer="Search index is not initialized on the search service. Run /v1/admin/clear to recreate the collection or initialize it on the search backend.",
+                hits=[]
+            )
         raise HTTPException(status_code=502, detail=f"Search service error: {e}")
 
     sr = SearchResponse(**search)
@@ -929,6 +936,10 @@ def compose_answer(req: ComposeRequest):
         )
         sr = SearchResponse(**search)
     except Exception as e:
+        msg = str(e)
+        # Friendly fallback when the Chroma collection is missing in the search service
+        if "InvalidCollectionException" in msg or "does not exist" in msg:
+            return {"answer": "Search index is not initialized on the search service. Run /v1/admin/clear to recreate the collection or initialize it on the search backend.", "hits": []}
         raise HTTPException(status_code=502, detail=f"Search service error: {e}")
 
     hits = sr.hits or []
@@ -980,4 +991,57 @@ def admin_clear():
         raise HTTPException(status_code=500, detail=f"Vector store clear failed: {e}")
 
     return {"ok": True, "cleared": cleared}
+
+@app.delete("/v1/docs/delete")
+def docs_delete(id: str):
+    # Example: DELETE /v1/docs/delete?id=<uuid>
+    # Removes the document, linked notes, and vector entries.
+    deleted = {"document": False, "notes": 0, "vectors": {"doc": False, "notes": 0}}
+    try:
+        # Collect linked note ids before DB deletion to remove vectors
+        note_ids = []
+        try:
+            rows = list_notes_for_doc(doc_id=id)
+            note_ids = [r.id for r in rows]
+        except Exception:
+            note_ids = []
+
+        # Delete from DB
+        with SessionLocal() as s:
+            # Ensure document exists
+            doc_exists = s.execute(sa_text("SELECT 1 FROM documents WHERE id = :id"), {"id": id}).fetchone()
+            if not doc_exists:
+                raise HTTPException(status_code=404, detail="Document not found")
+            # Delete notes linked to this document
+            try:
+                s.execute(sa_text("DELETE FROM decision_notes WHERE doc_id = :id"), {"id": id})
+                deleted["notes"] = len(note_ids)
+            except Exception:
+                # table may not exist
+                deleted["notes"] = 0
+            # Delete the document
+            s.execute(sa_text("DELETE FROM documents WHERE id = :id"), {"id": id})
+            s.commit()
+            deleted["document"] = True
+
+        # Delete vectors from Chroma
+        try:
+            client = get_client()
+            coll = client.get_or_create_collection(name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
+            # Remove doc vector
+            coll.delete(ids=[id])
+            deleted["vectors"]["doc"] = True
+            # Remove note vectors (best-effort)
+            if note_ids:
+                coll.delete(ids=note_ids)
+                deleted["vectors"]["notes"] = len(note_ids)
+        except Exception:
+            # Vector deletion may fail safely; keep DB state
+            pass
+
+        return {"ok": True, "deleted": deleted}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete document: {e}")
 
