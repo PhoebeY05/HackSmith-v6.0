@@ -11,7 +11,7 @@ class Document(Base):
     __tablename__ = "documents"
     id = Column(String, primary_key=True)  # same as vector id
     content = Column(Text, nullable=False)
-    metadata = Column(JSON, nullable=True)
+    meta = Column("metadata", JSON, nullable=True)
 
 def init_db():
     Base.metadata.create_all(engine)
@@ -21,9 +21,9 @@ def upsert_document(doc_id: str, content: str, metadata: dict | None = None):
         existing = s.get(Document, doc_id)
         if existing:
             existing.content = content
-            existing.metadata = metadata or {}
+            existing.meta = metadata or {}
         else:
-            s.add(Document(id=doc_id, content=content, metadata=metadata or {}))
+            s.add(Document(id=doc_id, content=content, meta=metadata or {}))
         s.commit()
 
 def get_documents(ids: list[str]) -> dict[str, Document]:
