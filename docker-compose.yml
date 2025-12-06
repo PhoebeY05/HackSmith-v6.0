@@ -7,6 +7,8 @@ services:
   api_gateway:
     image: python:3.11-slim
     working_dir: /app
+    env_file:
+      - .env
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app/src
@@ -17,6 +19,9 @@ services:
       - INGESTION_URL=http://ingestion_service:8000
       - METADATA_DB=/app/data/metadata.db
       - CHROMA_PATH=/app/data/chroma
+      # Fallback (override-able by .env)
+      - VT_API_KEY=${VT_API_KEY}
+      - ABUSEIPDB_API_KEY=${ABUSEIPDB_API_KEY}
     volumes:
       - ./:/app
       - ./data:/app/data

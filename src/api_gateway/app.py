@@ -1,3 +1,6 @@
+import json
+import os
+import urllib.request
 import uuid
 from datetime import datetime
 
@@ -85,6 +88,76 @@ class DecisionNoteIn(BaseModel):
 StructuredIngest.model_rebuild()
 
 app = FastAPI(title="API Gateway")
+
+# Endpoint I/O summary
+# /v1/ingest
+# Request (JSON, StructuredIngest):
+# {
+#   "title": string,
+#   "problem": string,
+#   "solution": string,
+#   "source": string = "entry",
+#   "code_snippet": string | null,
+#   "ioc_type": string | null,            # "ip" | "domain" | "hash" | "url" | "registry" | "malware family"
+#   "threat_level": string | null,        # "low" | "medium" | "high"
+#   "incident_type": string | null,       # "phishing" | "malware" | "misconfiguration" | "vuln"
+#   "notes": [{                           # optional decision notes to link to this document
+#     "title": string,
+#     "content": string,
+#     "kind": string = "ADR",
+#     "tags": [string]
+#   }]
+# }
+# Response:
+# {
+#   "job_id": string,     # equals id
+#   "id": string,         # document id (UUID)
+#   "ok": true,
+#   "note_ids": [string]  # UUIDs of saved notes (or "error:<msg>" entries)
+# }
+#
+# /v1/query
+# Request (JSON, QueryRequest) + optional query params:
+# Body: { "query": string, "k": number }
+# Query params (optional): ?ioc_type=...&incident_type=...&threat_level=...
+# Response (QueryResponse):
+# {
+#   "answer": string,     # renderer-composed answer from hits
+#   "hits": [             # top results (filtered)
+#     {
+#       "id": string,
+#       "text": string,
+#       "score": number,
+#       "metadata": {     # includes enrichment if present
+#         "title": string,
+#         "source": string,
+#         "problem": string,
+#         "code_snippet": string | null,
+#         "ioc_type": string | null,
+#         "threat_level": string | null,
+#         "incident_type": string | null,
+#         "artifacts_ips": string | null,
+#         "artifacts_domains": string | null,
+#         "artifacts_urls": string | null,
+#         "artifacts_hashes": string | null,
+#         "artifacts_registry": string | null,
+#         "vt_hash_reputation": string | null,
+#         "abuseipdb_ip_score": string | null,
+#         "urlhaus_signature": string | null,
+#         # for notes: type="note", note_kind, content_snippet, doc_id
+#       }
+#     }
+#   ]
+# }
+#
+# /v1/answers/compose
+# Request (JSON, ComposeRequest):
+# { "query": string, "k": number = 5, "include_notes": boolean = true }
+# Response:
+# {
+#   "answer": string,     # structured text with Problem, Code Snippet, Cybersecurity Context, Tradeoffs, Other Considerations
+#   "hits": [Hit]         # same shape as in /v1/query (model_dump of hits)
+# }
 
 # Initialize DB schema at startup
 @app.on_event("startup")
@@ -209,14 +282,122 @@ def _normalize_security_artifacts(text: str) -> dict:
         "log_snippet": log_snippet[:2000]
     }
 
+def _http_get_json(url: str, headers: dict | None = None, timeout: int = 6) -> dict | None:
+    try:
+        req = urllib.request.Request(url, headers=headers or {})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+            return json.loads(data.decode("utf-8"))
+    except Exception:
+        return None
+
+def _http_post_json(url: str, body: dict, headers: dict | None = None, timeout: int = 6) -> dict | None:
+    try:
+        data = json.dumps(body).encode("utf-8")
+        base_headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "api-gateway/1.0"
+        }
+        req = urllib.request.Request(url, data=data, headers={**base_headers, **(headers or {})})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        # Explicitly handle 307 Temporary Redirect for POST
+        if e.code in (301, 302, 303, 307, 308):
+            loc = e.headers.get("Location")
+            if loc:
+                try:
+                    req2 = urllib.request.Request(loc, data=json.dumps(body).encode("utf-8"),
+                                                  headers={**({"Content-Type": "application/json", "Accept": "application/json", "User-Agent": "api-gateway/1.0"}), **(headers or {})})
+                    with urllib.request.urlopen(req2, timeout=timeout) as resp2:
+                        return json.loads(resp2.read().decode("utf-8"))
+                except Exception as e2:
+                    print(f"[api_gateway] Redirect POST failed url={loc} err={e2}")
+                    return None
+        print(f"[api_gateway] POST failed url={url} code={e.code} err={e}")
+        return None
+    except Exception as e:
+        print(f"[api_gateway] POST failed url={url} err={e}")
+        return None
+
+def _enrich_threat_intel(artifacts: dict) -> dict:
+    """
+    Best-effort, optional enrichment:
+    - VirusTotal hash reputation (requires VT_API_KEY; skips if not present)
+    - AbuseIPDB IP score (requires ABUSEIPDB_API_KEY; skips if not present)
+    - URLhaus URL signature/family (no key required)
+    Returns scalar strings suitable for Chroma metadata.
+    """
+    vt_key = os.getenv("VT_API_KEY", "").strip()
+    abuse_key = os.getenv("ABUSEIPDB_API_KEY", "").strip()
+
+    out = {}
+    # VirusTotal hash reputation (sha256 preferred; accept any 32-64 hex)
+    hashes = artifacts.get("hashes") or []
+    if vt_key and hashes:
+        # pick first hash
+        h = hashes[0]
+        vt_url = f"https://www.virustotal.com/api/v3/files/{h}"
+        vt = _http_get_json(vt_url, headers={"x-apikey": vt_key})
+        if vt and isinstance(vt.get("data"), dict):
+            attrs = vt["data"].get("attributes") or {}
+            stats = attrs.get("last_analysis_stats") or {}
+            verdict = attrs.get("meaningful_name") or ""
+            # Compose a compact reputation string
+            detected = int(stats.get("malicious", 0)) + int(stats.get("suspicious", 0))
+            harmless = int(stats.get("harmless", 0))
+            out["vt_hash_reputation"] = f"detected:{detected}, harmless:{harmless}, name:{verdict}"[:200]
+
+    # AbuseIPDB for IPs
+    ips = artifacts.get("ips") or []
+    if abuse_key and ips:
+        ip = ips[0]
+        abuse_url = f"https://api.abuseipdb.com/api/v2/check?ipAddress={ip}&maxAgeInDays=90"
+        abuse = _http_get_json(abuse_url, headers={"Key": abuse_key, "Accept": "application/json"})
+        if abuse and isinstance(abuse.get("data"), dict):
+            data = abuse["data"]
+            score = data.get("abuseConfidenceScore")
+            country = (data.get("countryCode") or "")
+            out["abuseipdb_ip_score"] = f"score:{score}, country:{country}"[:200]
+
+    # URLhaus for URLs (no API key; POST supported)
+    urls = artifacts.get("urls") or []
+    if urls:
+        u = urls[0]
+        try:
+            import re
+            m = re.match(r"https?://([^/]+)", u)
+            host = m.group(1) if m else ""
+            if host:
+                urlhaus_api = "https://urlhaus.abuse.ch/api/host/"
+                j = _http_post_json(urlhaus_api, {"host": host})
+                if j and j.get("query_status") == "ok":
+                    entries = j.get("urls") or []
+                    sig = entries[0].get("signature") if entries else ""
+                    out["urlhaus_signature"] = (sig or "unknown")[:200]
+        except Exception:
+            pass
+
+    # Return only scalar strings to store in metadata
+    return out
+
 @app.post("/v1/ingest")
 def ingest(req: StructuredIngest):
     # Example: POST /v1/ingest
     # curl -s -X POST http://localhost:8000/v1/ingest \
     #   -H "Content-Type: application/json" \
-    #   -d '{ "title":"Login fails on mobile","problem":"Stale sessions","solution":"Reset session on login","source":"entry",
-    #         "code_snippet":"authRouter.post(...)", "ioc_type":"url","threat_level":"medium","incident_type":"phishing",
-    #         "notes":[{"title":"Tradeoffs","content":"Shorter TTL...","kind":"ADR","tags":["auth","ttl"]}] }'
+    #   -d '{
+    #     "title":"Suspicious outbound traffic",
+    #     "problem":"Firewall logs show repeated connections to known bad IP and domain. Hash observed in EDR alert.",
+    #     "solution":"Block IP/domain at edge; quarantine host; investigate related hashes.",
+    #     "source":"entry",
+    #     "ioc_type":"url",
+    #     "threat_level":"high",
+    #     "incident_type":"malware",
+    #     "code_snippet":"IPs: 45.83.64.12\nDomain: bad-example.co\nURL: https://bad-example.co/payload\nHash: 44d88612fea8a8f36de82e1278abb02f",
+    #     "notes":[{"title":"Tradeoffs","content":"Blocking entire /24 may impact legitimate services.","kind":"ADR","tags":["network","blocklist"]}]
+    #   }'
     # Validate and normalize
     title = req.title.strip()
     problem = req.problem.strip()
@@ -234,6 +415,12 @@ def ingest(req: StructuredIngest):
     sec_meta = {}
     # If user pasted artifacts into problem/solution fields, extract and attach
     artifacts = _normalize_security_artifacts(f"{title}\n{problem}\n{solution}\n{req.code_snippet or ''}")
+    # Ensure enrichment is defined before use
+    try:
+        enrichment = _enrich_threat_intel(artifacts)
+    except Exception:
+        enrichment = {}
+
     if any(artifacts[k] for k in ("ips","domains","urls","hashes","registry")) or artifacts["log_snippet"]:
         combined += "\nArtifacts:\n"
         if artifacts["ips"]:
@@ -294,6 +481,13 @@ def ingest(req: StructuredIngest):
     metadata.update(_meta_list("artifacts_urls", sec_meta.get("artifacts_urls")))
     metadata.update(_meta_list("artifacts_hashes", sec_meta.get("artifacts_hashes")))
     metadata.update(_meta_list("artifacts_registry", sec_meta.get("artifacts_registry")))
+    # Inject enrichment scalars (optional; only if present)
+    if enrichment.get("vt_hash_reputation"):
+        metadata["vt_hash_reputation"] = enrichment["vt_hash_reputation"]
+    if enrichment.get("abuseipdb_ip_score"):
+        metadata["abuseipdb_ip_score"] = enrichment["abuseipdb_ip_score"]
+    if enrichment.get("urlhaus_signature"):
+        metadata["urlhaus_signature"] = enrichment["urlhaus_signature"]
 
     try:
         vs_upsert(id=doc_id, embedding=embedding, document=combined, metadata=metadata)
@@ -547,6 +741,20 @@ def _compose_blocks(query: str, hits: list, notes_summary: str | None) -> str:
     artifacts_urls = (primary_meta.get("artifacts_urls") or "").strip()
     artifacts_hashes = (primary_meta.get("artifacts_hashes") or "").strip()
     artifacts_registry = (primary_meta.get("artifacts_registry") or "").strip()
+
+    # New: enrichment fields; if missing on primary, fallback to first hit that has them
+    vt_hash_rep = (primary_meta.get("vt_hash_reputation") or "").strip()
+    abuse_ip_score = (primary_meta.get("abuseipdb_ip_score") or "").strip()
+    urlhaus_sig = (primary_meta.get("urlhaus_signature") or "").strip()
+    if not (vt_hash_rep and abuse_ip_score and urlhaus_sig):
+        for h in hits or []:
+            meta_h = h.metadata or {}
+            vt_hash_rep = vt_hash_rep or (meta_h.get("vt_hash_reputation") or "").strip()
+            abuse_ip_score = abuse_ip_score or (meta_h.get("abuseipdb_ip_score") or "").strip()
+            urlhaus_sig = urlhaus_sig or (meta_h.get("urlhaus_signature") or "").strip()
+            if vt_hash_rep and abuse_ip_score and urlhaus_sig:
+                break
+
     sec_lines = []
     if ioc_type:
         sec_lines.append(f"- IOC Type: {ioc_type}")
@@ -560,6 +768,14 @@ def _compose_blocks(query: str, hits: list, notes_summary: str | None) -> str:
         sec_lines.append(f"- Hashes: {artifacts_hashes}")
     if artifacts_registry:
         sec_lines.append(f"- Registry: {artifacts_registry}")
+    # Include enrichment, if present
+    if vt_hash_rep:
+        sec_lines.append(f"- VT Hash Reputation: {vt_hash_rep}")
+    if abuse_ip_score:
+        sec_lines.append(f"- AbuseIPDB IP Score: {abuse_ip_score}")
+    if urlhaus_sig:
+        sec_lines.append(f"- URLhaus Signature: {urlhaus_sig}")
+
     if sec_lines:
         solution_section += "\n\nCybersecurity Context\n" + "\n".join(sec_lines)
 
@@ -570,21 +786,18 @@ def _compose_blocks(query: str, hits: list, notes_summary: str | None) -> str:
         meta = h.metadata or {}
         title = _safe_title(meta, (h.text.splitlines()[0][:50] if h.text else ""))
         if _is_tradeoff(meta, title):
-            snippet = _clean_snippet(h.text, 200)
-            for b in _to_bullets(snippet, max_items=2, max_item_len=160):
-                if b not in tradeoff_bullets:
-                    tradeoff_bullets.append(b)
-    tradeoff_bullets = tradeoff_bullets[:5]
+            tradeoff_bullets.append(f"- {title} (score: {h.score:.3f})")
+    # Cap and render
     if tradeoff_bullets:
-        for b in tradeoff_bullets:
-            tradeoffs_section += f"\n- {b}"
+        tradeoffs_section += "\n" + "\n".join(tradeoff_bullets[:6])
     else:
-        tradeoffs_section += "\n- No prior tradeoffs found. Consider adding ADR notes."
+        tradeoffs_section += "\n- No tradeoffs or ADRs found."
 
-    # Section 4: Other Considerations (incidents/RCA, ops/warnings, non-tradeoff references)
+    # Section 4: Other Considerations (incidents, warnings, general refs)
     other_section = "Other Considerations"
     seen_titles = set()
-    other_items = []
+    # First pass: collect by type
+    incidents, warnings, general_refs = [], [], []
     for h in hits[:8]:
         meta = h.metadata or {}
         title = _safe_title(meta, (h.text.splitlines()[0][:50] if h.text else ""))
@@ -592,20 +805,23 @@ def _compose_blocks(query: str, hits: list, notes_summary: str | None) -> str:
         if key in seen_titles:
             continue
         seen_titles.add(key)
-        # Skip tradeoff items; collect incidents/rca/warnings/ops or general refs
-        if _is_tradeoff(meta, title):
-            continue
-        snippet = _clean_snippet(h.text, 200)
-        if _is_incident(meta, title) or _is_warning_or_ops(meta, h.text):
-            other_items.append(f"- {title} (score: {h.score:.3f})\n  {snippet}")
+        if _is_incident(meta, title):
+            incidents.append(f"- {title} (score: {h.score:.3f})")
+        elif _is_warning_or_ops(meta, h.text):
+            warnings.append(f"- {title} (score: {h.score:.3f})")
         else:
+            snippet = _clean_snippet(h.text, 200)
             # keep concise general references, avoid very short/vague snippets
             if len(snippet) >= 20:
-                other_items.append(f"- {title} (score: {h.score:.3f})\n  {snippet}")
-    # Cap and render
-    if other_items:
-        other_section += "\n" + "\n".join(other_items[:6])
-    else:
+                general_refs.append(f"- {title} (score: {h.score:.3f})\n  {snippet}")
+    # Render all found items
+    if incidents:
+        other_section += "\nIncidents:\n" + "\n".join(incidents[:3])
+    if warnings:
+        other_section += "\nWarnings/Ops Considerations:\n" + "\n".join(warnings[:3])
+    if general_refs:
+        other_section += "\nGeneral References:\n" + "\n".join(general_refs[:3])
+    if not (incidents or warnings or general_refs):
         other_section += "\n- No additional considerations."
 
     # Final composition
@@ -739,9 +955,3 @@ def admin_clear():
 
     return {"ok": True, "cleared": cleared}
 
-# Telemetry heatmap (if present)
-@app.get("/v1/telemetry/heatmap")
-def telemetry_heatmap(limit: int = 1000):
-    # Example: GET /v1/telemetry/heatmap?limit=500
-    # curl -s "http://localhost:8000/v1/telemetry/heatmap?limit=500"
-    pass  # ...existing code...
