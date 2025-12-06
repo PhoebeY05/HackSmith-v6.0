@@ -1,11 +1,25 @@
-from fastapi import FastAPI, HTTPException
+import uuid
 
-from src.common.config import INGESTION_URL, RENDERER_URL, SEARCH_URL
+from fastapi import FastAPI, Form, HTTPException
+from pydantic import BaseModel, Field
+
+from src.common.config import (EMBEDDING_URL, INGESTION_URL, RENDERER_URL,
+                               SEARCH_URL)
 from src.common.db import init_db  # ensure tables exist
+from src.common.db import upsert_document
 from src.common.http import post_json
-from src.common.schemas import (IngestRequest, IngestResponse, QueryRequest,
+from src.common.schemas import (EmbedRequest, EmbedResponse, QueryRequest,
                                 QueryResponse, RenderRequest, RenderResponse,
                                 SearchRequest, SearchResponse)
+from src.common.vector_store import upsert as vs_upsert
+
+
+# Define a JSON schema for structured ingest
+class StructuredIngest(BaseModel):
+    title: str = Field(..., min_length=1)
+    problem: str = Field(..., min_length=1)
+    solution: str = Field(..., min_length=1)
+    source: str = Field(default="entry")
 
 app = FastAPI(title="API Gateway")
 
@@ -40,12 +54,40 @@ def status():
         "errors": errors,
     }
 
-@app.post("/v1/ingest", response_model=IngestResponse)
-def ingest(req: IngestRequest):
-    if not req.text and not req.repo_url:
-        raise HTTPException(status_code=400, detail="Provide text or repo_url")
-    data = post_json(f"{INGESTION_URL}/v1/ingest", req.model_dump())
-    return IngestResponse(**data)
+@app.post("/v1/ingest")
+def ingest(req: StructuredIngest):
+    # Validate and normalize
+    title = req.title.strip()
+    problem = req.problem.strip()
+    solution = req.solution.strip()
+    if not title or not problem or not solution:
+        raise HTTPException(status_code=400, detail="Provide title, problem, and solution")
+
+    # Build combined searchable text
+    combined = f"Title: {title}\nProblem: {problem}\nSolution: {solution}"
+
+    # Embed combined text
+    try:
+        emb = post_json(f"{EMBEDDING_URL}/v1/embed", EmbedRequest(texts=[combined]).model_dump())
+        er = EmbedResponse(**emb)
+        embedding = er.embeddings[0]
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Embedding service error: {e}")
+
+    # Upsert into vector store and metadata DB
+    doc_id = str(uuid.uuid4())
+    metadata = {
+        "source": req.source,
+        "title": title,
+        "problem": problem[:500],
+    }
+    try:
+        vs_upsert(id=doc_id, embedding=embedding, document=combined, metadata=metadata)
+        upsert_document(doc_id, combined, metadata)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Indexing error: {e}")
+
+    return {"job_id": doc_id, "id": doc_id, "ok": True}
 
 @app.post("/v1/query", response_model=QueryResponse)
 def query(req: QueryRequest):
