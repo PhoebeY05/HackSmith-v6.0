@@ -1,0 +1,89 @@
+services:
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  api_gateway:
+    image: python:3.11-slim
+    working_dir: /app
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app/src
+      - REDIS_URL=redis://redis:6379/0
+      - EMBEDDING_URL=http://embedding_service:8000
+      - SEARCH_URL=http://search_service:8000
+      - RENDERER_URL=http://renderer:8000
+      - INGESTION_URL=http://ingestion_service:8000
+      - METADATA_DB=/app/data/metadata.db
+      - CHROMA_PATH=/app/data/chroma
+    volumes:
+      - ./:/app
+      - ./data:/app/data
+    command: sh -c "pip install -r requirements.txt && uvicorn src.api_gateway.app:app --host 0.0.0.0 --port 8000 --reload"
+    ports:
+      - "8000:8000"
+    depends_on: [embedding_service, search_service, renderer, ingestion_service, redis]
+
+  ingestion_service:
+    image: python:3.11-slim
+    working_dir: /app
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app/src
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./:/app
+    command: sh -c "pip install -r requirements.txt && uvicorn src.ingestion_service.app:app --host 0.0.0.0 --port 8000 --reload"
+    depends_on: [redis]
+
+  indexer_worker:
+    image: python:3.11-slim
+    working_dir: /app
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app/src
+      - REDIS_URL=redis://redis:6379/0
+      - EMBEDDING_URL=http://embedding_service:8000
+      - METADATA_DB=/app/data/metadata.db
+      - CHROMA_PATH=/app/data/chroma
+    volumes:
+      - ./:/app
+      - ./data:/app/data
+    command: sh -c "pip install -r requirements.txt && rq worker -u redis://redis:6379 index"
+    depends_on: [redis, embedding_service]
+
+  embedding_service:
+    image: python:3.11-slim
+    working_dir: /app
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app/src
+    volumes:
+      - ./:/app
+    command: sh -c "pip install -r requirements.txt && uvicorn src.embedding_service.app:app --host 0.0.0.0 --port 8000 --reload"
+
+  search_service:
+    image: python:3.11-slim
+    working_dir: /app
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app/src
+      - EMBEDDING_URL=http://embedding_service:8000
+      - METADATA_DB=/app/data/metadata.db
+      - CHROMA_PATH=/app/data/chroma
+    volumes:
+      - ./:/app
+      - ./data:/app/data
+    command: sh -c "pip install -r requirements.txt && uvicorn src.search_service.app:app --host 0.0.0.0 --port 8000 --reload"
+    depends_on: [embedding_service]
+
+  renderer:
+    image: python:3.11-slim
+    working_dir: /app
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app/src
+    volumes:
+      - ./:/app
+    command: sh -c "pip install -r requirements.txt && uvicorn src.renderer.app:app --host 0.0.0.0 --port 8000 --reload"
