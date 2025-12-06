@@ -519,7 +519,18 @@ def _compose_blocks(query: str, hits: list, notes_summary: str | None) -> str:
 
     # Section 1: Problem Addressed (prefer primary doc metadata.problem; fallback to query)
     problem_text = (primary_meta.get("problem") or query or "").strip()
-    problem_section = "Problem Addressed\n- " + problem_text
+    # New: append security context (incident_type + threat_level) if present
+    incident = (primary_meta.get("incident_type") or "").strip()
+    threat = (primary_meta.get("threat_level") or "").strip()
+    sec_suffix = ""
+    if incident or threat:
+        ctx = []
+        if incident:
+            ctx.append(f"incident_type: {incident}")
+        if threat:
+            ctx.append(f"threat_level: {threat}")
+        sec_suffix = f" [{'; '.join(ctx)}]"
+    problem_section = "Problem Addressed\n- " + problem_text + sec_suffix
 
     # Section 2: Solution (exclude notes entirely)
     solution_text = (primary_meta.get("code_snippet") or "")
@@ -528,6 +539,29 @@ def _compose_blocks(query: str, hits: list, notes_summary: str | None) -> str:
         solution_section += "\n" + _clean_snippet(solution_text.strip(), max_len=280)
     else:
         solution_section += "\n- No direct fix found. Refine the query or ingest more content."
+
+    # New: add Cybersecurity context bullets under Solution when relevant
+    ioc_type = (primary_meta.get("ioc_type") or "").strip()
+    artifacts_ips = (primary_meta.get("artifacts_ips") or "").strip()
+    artifacts_domains = (primary_meta.get("artifacts_domains") or "").strip()
+    artifacts_urls = (primary_meta.get("artifacts_urls") or "").strip()
+    artifacts_hashes = (primary_meta.get("artifacts_hashes") or "").strip()
+    artifacts_registry = (primary_meta.get("artifacts_registry") or "").strip()
+    sec_lines = []
+    if ioc_type:
+        sec_lines.append(f"- IOC Type: {ioc_type}")
+    if artifacts_ips:
+        sec_lines.append(f"- IPs: {artifacts_ips}")
+    if artifacts_domains:
+        sec_lines.append(f"- Domains: {artifacts_domains}")
+    if artifacts_urls:
+        sec_lines.append(f"- URLs: {artifacts_urls}")
+    if artifacts_hashes:
+        sec_lines.append(f"- Hashes: {artifacts_hashes}")
+    if artifacts_registry:
+        sec_lines.append(f"- Registry: {artifacts_registry}")
+    if sec_lines:
+        solution_section += "\n\nCybersecurity Context\n" + "\n".join(sec_lines)
 
     # Section 3: Tradeoffs (ADR + tradeoff-like hits + tradeoff text from notes_summary)
     tradeoffs_section = "Tradeoffs"
