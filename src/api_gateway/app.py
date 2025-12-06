@@ -566,14 +566,19 @@ def query(req: QueryRequest, ioc_type: str | None = None, incident_type: str | N
 
     sr = SearchResponse(**search)
 
-    # New: defensively ensure each hit has a valid text string
+    # New: defensively ensure each hit has metadata and non-empty text; drop orphans
     safe_hits = []
     for h in sr.hits or []:
+        # normalize metadata to dict
+        if not isinstance(h.metadata, dict) or h.metadata is None:
+            h.metadata = {}
         # patch text from metadata if missing
         if not isinstance(h.text, str) or not h.text.strip():
-            meta = h.metadata or {}
-            patched = (meta.get("content_snippet") or meta.get("problem") or "") or ""
+            patched = (h.metadata.get("content_snippet") or h.metadata.get("problem") or "") or ""
             h.text = patched if isinstance(patched, str) else ""
+        # skip hits that still have empty text after patching (likely orphaned after delete)
+        if not h.text.strip():
+            continue
         safe_hits.append(h)
     sr.hits = safe_hits
 
@@ -1018,19 +1023,26 @@ def compose_answer(req: ComposeRequest):
             return {"answer": "Search index is not initialized on the search service. Run /v1/admin/clear to recreate the collection or initialize it on the search backend.", "hits": []}
         raise HTTPException(status_code=502, detail=f"Search service error: {e}")
 
-    # New: defensively ensure each hit has a valid text string
+    # New: defensively normalize metadata, patch text, and drop orphans
     safe_hits = []
     for h in (sr.hits or []):
+        if not isinstance(h.metadata, dict) or h.metadata is None:
+            h.metadata = {}
         if not isinstance(h.text, str) or not h.text.strip():
-            meta = h.metadata or {}
-            patched = (meta.get("content_snippet") or meta.get("problem") or "") or ""
+            patched = (h.metadata.get("content_snippet") or h.metadata.get("problem") or "") or ""
             h.text = patched if isinstance(patched, str) else ""
+        if not h.text.strip():
+            continue
         safe_hits.append(h)
-    hits = safe_hits
+
+    # New: enforce minimum score for compose
+    min_score = 0.25
+    hits = [h for h in safe_hits if (h.score or 0.0) >= min_score]
 
     notes_summary = _summarize_notes_inline(req.query) if req.include_notes else None
     answer = _compose_blocks(req.query, hits, notes_summary)
-    # ...existing code that filters notes from returned hits...
+
+    # New: return only non-note hits meeting the score threshold
     non_note_hits = [h for h in hits if ((h.metadata or {}).get("type") or "").lower() != "note"]
     return {"answer": answer, "hits": [h.model_dump() for h in non_note_hits]}
 
