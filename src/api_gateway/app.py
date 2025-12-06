@@ -591,7 +591,7 @@ def query(req: QueryRequest, ioc_type: str | None = None, incident_type: str | N
                 try:
                     rows = list_notes_for_doc(doc_id=h.id)
                     meta["related_notes"] = [
-                        {"id": r.id, "title": r.title, "kind": r.kind, "created_at": r.created_at}
+                        {"id": r.id, "title": r.title, "kind": r.kind, "created_at": r.created_at, "text": r.content, "tags": r.tags}
                         for r in rows
                     ]
                     h.metadata = meta
