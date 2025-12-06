@@ -812,44 +812,111 @@ def _compose_blocks(query: str, hits: list, notes_summary: str | None) -> str:
     if sec_lines:
         solution_section += "\n\nCybersecurity Context\n" + "\n".join(sec_lines)
 
-    # Section 3: Tradeoffs (ADR + tradeoff-like hits + tradeoff text from notes_summary)
+    # Fix: define notes_only and helper before any usage
+    notes_only = [h for h in (hits or []) if ((h.metadata or {}).get("type") or "").lower() == "note"]
+    def _note_snippet(h) -> str:
+        meta = h.metadata or {}
+        raw = (meta.get("content_snippet") or h.text or "") or ""
+        return _clean_snippet(raw, 220)
+
+    # New: tracking sets to deduplicate across sections
+    trade_titles_seen = set()       # normalized titles added to Tradeoffs
+    other_titles_seen = set()       # normalized titles added to Other Considerations
+
+    def _norm_title(t: str) -> str:
+        return (t or "").strip().lower()
+
+    # Section 3: Tradeoffs (prioritize ADR notes, dedupe by title)
     tradeoffs_section = "Tradeoffs"
-    tradeoff_bullets = _to_bullets(notes_summary or "", max_items=5, max_item_len=160)
-    for h in hits[:6]:
+    tradeoff_bullets = []
+    for h in notes_only:
+        meta = h.metadata or {}
+        kind = (meta.get("note_kind") or "").lower()
+        if kind == "adr":
+            title = _safe_title(meta, (h.text.splitlines()[0][:50] if h.text else ""))
+            nt = _norm_title(title)
+            if nt in trade_titles_seen:
+                continue
+            trade_titles_seen.add(nt)
+            snippet = _note_snippet(h)
+            tradeoff_bullets.append(f"- {title}: {snippet}" if snippet else f"- {title} (score: {h.score:.3f})")
+            if len(tradeoff_bullets) >= 5:
+                break
+    if not tradeoff_bullets:
+        for h in hits[:6]:
+            meta = h.metadata or {}
+            title = _safe_title(meta, (h.text.splitlines()[0][:50] if h.text else ""))
+            nt = _norm_title(title)
+            if nt in trade_titles_seen:
+                continue
+            if _is_tradeoff(meta, title):
+                trade_titles_seen.add(nt)
+                tradeoff_bullets.append(f"- {title} (score: {h.score:.3f})")
+
+    if notes_summary:
+        for b in _to_bullets(notes_summary, max_items=3, max_item_len=160):
+            # avoid adding an identical bullet twice
+            if b not in tradeoff_bullets:
+                tradeoff_bullets.append(b)
+
+    tradeoffs_section += ("\n" + "\n".join(tradeoff_bullets[:6])) if tradeoff_bullets else "\n- No tradeoffs or ADRs found."
+
+    # Section 4: Other Considerations (dedupe against trade_titles_seen and within section)
+    other_section = "Other Considerations"
+    incidents, warnings, general_refs = [], [], []
+
+    # Prefer Incident/RCA notes first
+    for h in notes_only:
         meta = h.metadata or {}
         title = _safe_title(meta, (h.text.splitlines()[0][:50] if h.text else ""))
-        if _is_tradeoff(meta, title):
-            tradeoff_bullets.append(f"- {title} (score: {h.score:.3f})")
-    # Cap and render
-    if tradeoff_bullets:
-        tradeoffs_section += "\n" + "\n".join(tradeoff_bullets[:6])
-    else:
-        tradeoffs_section += "\n- No tradeoffs or ADRs found."
+        nt = _norm_title(title)
+        if nt in other_titles_seen or nt in trade_titles_seen:
+            continue
+        kind = (meta.get("note_kind") or "").lower()
+        if kind in ("incident", "bug rca", "rca"):
+            other_titles_seen.add(nt)
+            snippet = _note_snippet(h)
+            incidents.append(f"- {title}: {snippet}" if snippet else f"- {title} (score: {h.score:.3f})")
+            if len(incidents) >= 3:
+                break
 
-    # Section 4: Other Considerations (incidents, warnings, general refs)
-    other_section = "Other Considerations"
-    seen_titles = set()
-    # First pass: collect by type
-    incidents, warnings, general_refs = [], [], []
+    # Prefer warnings/ops notes next
+    for h in notes_only:
+        meta = h.metadata or {}
+        title = _safe_title(meta, (h.text.splitlines()[0][:50] if h.text else ""))
+        nt = _norm_title(title)
+        if nt in other_titles_seen or nt in trade_titles_seen:
+            continue
+        text_lower = (_note_snippet(h) or h.text or "").lower()
+        if "warning" in text_lower or "caveat" in text_lower or "ops" in text_lower or "operations" in text_lower:
+            other_titles_seen.add(nt)
+            snippet = _note_snippet(h)
+            warnings.append(f"- {title}: {snippet}" if snippet else f"- {title} (score: {h.score:.3f})")
+            if len(warnings) >= 3:
+                break
+
+    # Fill remaining from general (non-note) references (exclude tradeoff-like items)
     for h in hits[:8]:
         meta = h.metadata or {}
         title = _safe_title(meta, (h.text.splitlines()[0][:50] if h.text else ""))
-        key = title.lower()
-        if key in seen_titles:
+        nt = _norm_title(title)
+        if nt in other_titles_seen or nt in trade_titles_seen:
             continue
-        seen_titles.add(key)
+        # Skip tradeoff-like items in general refs
+        if _is_tradeoff(meta, title):
+            continue
+        other_titles_seen.add(nt)
         if _is_incident(meta, title):
             incidents.append(f"- {title} (score: {h.score:.3f})")
         elif _is_warning_or_ops(meta, h.text):
             warnings.append(f"- {title} (score: {h.score:.3f})")
         else:
             snippet = _clean_snippet(h.text, 200)
-            # keep concise general references, avoid very short/vague snippets
             if len(snippet) >= 20:
                 general_refs.append(f"- {title} (score: {h.score:.3f})\n  {snippet}")
-    # Render all found items
+
     if incidents:
-        other_section += "\nIncidents:\n" + "\n".join(incidents[:3])
+        other_section += "\nIncidents/RCA:\n" + "\n".join(incidents[:3])
     if warnings:
         other_section += "\nWarnings/Ops Considerations:\n" + "\n".join(warnings[:3])
     if general_refs:
@@ -857,7 +924,6 @@ def _compose_blocks(query: str, hits: list, notes_summary: str | None) -> str:
     if not (incidents or warnings or general_refs):
         other_section += "\n- No additional considerations."
 
-    # Final composition
     return "\n\n".join([
         problem_section.strip(),
         solution_section.strip(),
@@ -888,7 +954,8 @@ def _extract_keywords(q: str) -> list[str]:
     out, seen = [], set()
     for t in toks:
         if t not in seen:
-            out.append(t); seen.add(t)
+            out.append(t)
+            seen.add(t)
     return out[:5]
 
 def _summarize_notes_inline(query: str) -> str | None:
@@ -928,7 +995,6 @@ def compose_answer(req: ComposeRequest):
     # curl -s -X POST http://localhost:8000/v1/answers/compose \
     #   -H "Content-Type: application/json" \
     #   -d '{ "query":"phishing mitigation", "k":5, "include_notes":true }'
-    # Search top-k
     try:
         search = post_json(
             f"{SEARCH_URL}/v1/search",
@@ -937,7 +1003,6 @@ def compose_answer(req: ComposeRequest):
         sr = SearchResponse(**search)
     except Exception as e:
         msg = str(e)
-        # Friendly fallback when the Chroma collection is missing in the search service
         if "InvalidCollectionException" in msg or "does not exist" in msg:
             return {"answer": "Search index is not initialized on the search service. Run /v1/admin/clear to recreate the collection or initialize it on the search backend.", "hits": []}
         raise HTTPException(status_code=502, detail=f"Search service error: {e}")
@@ -951,18 +1016,15 @@ def compose_answer(req: ComposeRequest):
 def admin_clear():
     # Example: POST /v1/admin/clear
     # curl -s -X POST http://localhost:8000/v1/admin/clear
-    # Response: { "ok": true, "cleared": { "documents": N, "decision_notes": M, ... } }
-    # Clear SQLite tables
     cleared = {"documents": 0, "decision_notes": 0, "vector_collection_deleted": False, "vector_collection_recreated": False}
     try:
         with SessionLocal() as s:
             # Count before delete
             docs_before = s.execute(sa_text("SELECT COUNT(*) FROM documents")).scalar() or 0
-            notes_before = 0
             try:
                 notes_before = s.execute(sa_text("SELECT COUNT(*) FROM decision_notes")).scalar() or 0
             except Exception:
-                notes_before = 0  # table may not exist yet
+                notes_before = 0
             s.execute(sa_text("DELETE FROM documents"))
             try:
                 s.execute(sa_text("DELETE FROM decision_notes"))
@@ -974,17 +1036,14 @@ def admin_clear():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB clear failed: {e}")
 
-    # Clear Chroma collection using the shared client to avoid settings conflicts
+    # Clear Chroma collection using the shared client
     try:
-        client = get_client()  # shared PersistentClient with consistent settings
-        # Delete collection if present
+        client = get_client()
         try:
             client.delete_collection(COLLECTION_NAME)
             cleared["vector_collection_deleted"] = True
         except Exception:
-            # If not exists, ignore
             pass
-        # Recreate collection with the same metadata used elsewhere
         client.get_or_create_collection(name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
         cleared["vector_collection_recreated"] = True
     except Exception as e:
@@ -995,11 +1054,9 @@ def admin_clear():
 @app.delete("/v1/docs/delete")
 def docs_delete(id: str):
     # Example: DELETE /v1/docs/delete?id=<uuid>
-    # Removes the document, linked notes, and vector entries.
     deleted = {"document": False, "notes": 0, "vectors": {"doc": False, "notes": 0}}
     try:
-        # Collect linked note ids before DB deletion to remove vectors
-        note_ids = []
+        # Collect linked note ids
         try:
             rows = list_notes_for_doc(doc_id=id)
             note_ids = [r.id for r in rows]
@@ -1008,35 +1065,28 @@ def docs_delete(id: str):
 
         # Delete from DB
         with SessionLocal() as s:
-            # Ensure document exists
             doc_exists = s.execute(sa_text("SELECT 1 FROM documents WHERE id = :id"), {"id": id}).fetchone()
             if not doc_exists:
                 raise HTTPException(status_code=404, detail="Document not found")
-            # Delete notes linked to this document
             try:
                 s.execute(sa_text("DELETE FROM decision_notes WHERE doc_id = :id"), {"id": id})
                 deleted["notes"] = len(note_ids)
             except Exception:
-                # table may not exist
                 deleted["notes"] = 0
-            # Delete the document
             s.execute(sa_text("DELETE FROM documents WHERE id = :id"), {"id": id})
             s.commit()
             deleted["document"] = True
 
-        # Delete vectors from Chroma
+        # Delete vectors from Chroma (best-effort)
         try:
             client = get_client()
             coll = client.get_or_create_collection(name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
-            # Remove doc vector
             coll.delete(ids=[id])
             deleted["vectors"]["doc"] = True
-            # Remove note vectors (best-effort)
             if note_ids:
                 coll.delete(ids=note_ids)
                 deleted["vectors"]["notes"] = len(note_ids)
         except Exception:
-            # Vector deletion may fail safely; keep DB state
             pass
 
         return {"ok": True, "deleted": deleted}
