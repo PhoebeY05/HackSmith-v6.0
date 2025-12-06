@@ -29,6 +29,10 @@ class StructuredIngest(BaseModel):
     notes: list["DecisionNoteIn"] = Field(default_factory=list)
     # New: optional code snippet to support copy-ready blocks
     code_snippet: str | None = Field(default=None, description="Optional code snippet relevant to the solution")
+    # New: security-specific optional metadata
+    ioc_type: str | None = Field(default=None, description="ip | domain | hash | url | registry | malware family")
+    threat_level: str | None = Field(default=None, description="low | medium | high")
+    incident_type: str | None = Field(default=None, description="phishing | malware | misconfiguration | vuln")
     model_config = {
         "json_schema_extra": {
             "examples": [
@@ -93,11 +97,15 @@ def _startup_init_db():
 
 @app.get("/health")
 def health():
+    # Example: GET /health
+    # curl -s http://localhost:8000/health
     return {"ok": True}
 
 # New: status endpoint that checks downstream services
 @app.get("/v1/status")
 def status():
+    # Example: GET /v1/status
+    # curl -s http://localhost:8000/v1/status
     errors = []
     def check(url: str):
         try:
@@ -115,6 +123,10 @@ def status():
 
 @app.post("/v1/notes/add")
 def notes_add(req: DecisionNoteIn):
+    # Example: POST /v1/notes/add
+    # curl -s -X POST http://localhost:8000/v1/notes/add \
+    #   -H "Content-Type: application/json" \
+    #   -d '{ "title":"DB deadlock tradeoffs","content":"Retry logic...","kind":"ADR","tags":["db","deadlock"] }'
     note_id = str(uuid.uuid4())
     try:
         add_note(
@@ -132,6 +144,8 @@ def notes_add(req: DecisionNoteIn):
 
 @app.get("/v1/notes/list")
 def notes_list(limit: int = 20):
+    # Example: GET /v1/notes/list?limit=10
+    # curl -s "http://localhost:8000/v1/notes/list?limit=10"
     try:
         rows = list_notes(limit=limit)
         return {"items": [
@@ -143,6 +157,8 @@ def notes_list(limit: int = 20):
 
 @app.get("/v1/notes/search")
 def notes_search(tag: str, limit: int = 20):
+    # Example: GET /v1/notes/search?tag=auth&limit=5
+    # curl -s "http://localhost:8000/v1/notes/search?tag=auth&limit=5"
     try:
         rows = search_notes_by_tag(tag=tag, limit=limit)
         return {"items": [
@@ -154,6 +170,8 @@ def notes_search(tag: str, limit: int = 20):
 
 @app.get("/v1/notes/match")
 def notes_match(keyword: str, limit: int = 10):
+    # Example: GET /v1/notes/match?keyword=session&limit=10
+    # curl -s "http://localhost:8000/v1/notes/match?keyword=session&limit=10"
     try:
         rows = match_notes(keyword=keyword, limit=limit)
         return {"items": [
@@ -170,8 +188,35 @@ def notes_match(keyword: str, limit: int = 10):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to match notes: {e}")
 
+# Helpers: normalize and extract security artifacts from free-form text
+def _normalize_security_artifacts(text: str) -> dict:
+    import re
+    s = (text or "").strip()
+    ips = re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", s)
+    domains = re.findall(r"\b([a-z0-9-]+\.)+[a-z]{2,}\b", s)
+    urls = re.findall(r"https?://[^\s]+", s)
+    hashes = re.findall(r"\b[a-f0-9]{32,64}\b", s, flags=re.IGNORECASE)
+    registry = re.findall(r"\bHKEY_[A-Z_]+\\[^\s]+", s)
+    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+    log_snippet = "\n".join(lines[:20])
+    def _dedupe(arr): return sorted(list(dict.fromkeys(arr)))
+    return {
+        "ips": _dedupe(ips),
+        "domains": _dedupe([d for d in domains if d not in ips]),
+        "urls": _dedupe(urls),
+        "hashes": _dedupe(hashes),
+        "registry": _dedupe(registry),
+        "log_snippet": log_snippet[:2000]
+    }
+
 @app.post("/v1/ingest")
 def ingest(req: StructuredIngest):
+    # Example: POST /v1/ingest
+    # curl -s -X POST http://localhost:8000/v1/ingest \
+    #   -H "Content-Type: application/json" \
+    #   -d '{ "title":"Login fails on mobile","problem":"Stale sessions","solution":"Reset session on login","source":"entry",
+    #         "code_snippet":"authRouter.post(...)", "ioc_type":"url","threat_level":"medium","incident_type":"phishing",
+    #         "notes":[{"title":"Tradeoffs","content":"Shorter TTL...","kind":"ADR","tags":["auth","ttl"]}] }'
     # Validate and normalize
     title = req.title.strip()
     problem = req.problem.strip()
@@ -185,6 +230,32 @@ def ingest(req: StructuredIngest):
     if (req.code_snippet or "").strip():
         snippet_trim = _clean_snippet(req.code_snippet.strip(), max_len=300)
         combined += f"\nCode:\n{snippet_trim}"
+    # New: security artifact normalization (augment indexed text minimally)
+    sec_meta = {}
+    # If user pasted artifacts into problem/solution fields, extract and attach
+    artifacts = _normalize_security_artifacts(f"{title}\n{problem}\n{solution}\n{req.code_snippet or ''}")
+    if any(artifacts[k] for k in ("ips","domains","urls","hashes","registry")) or artifacts["log_snippet"]:
+        combined += "\nArtifacts:\n"
+        if artifacts["ips"]:
+            combined += "IPs: " + ", ".join(artifacts["ips"][:10]) + ("\n" if artifacts["ips"] else "")
+        if artifacts["domains"]:
+            combined += "Domains: " + ", ".join(artifacts["domains"][:10]) + ("\n" if artifacts["domains"] else "")
+        if artifacts["urls"]:
+            combined += "URLs: " + ", ".join(artifacts["urls"][:10]) + ("\n" if artifacts["urls"] else "")
+        if artifacts["hashes"]:
+            combined += "Hashes: " + ", ".join(artifacts["hashes"][:10]) + ("\n" if artifacts["hashes"] else "")
+        if artifacts["registry"]:
+            combined += "Registry: " + ", ".join(artifacts["registry"][:5]) + ("\n" if artifacts["registry"] else "")
+        if artifacts["log_snippet"]:
+            combined += "Log:\n" + _clean_snippet(artifacts["log_snippet"], max_len=600) + "\n"
+        # stash artifacts into metadata
+        sec_meta = {
+            "artifacts_ips": artifacts["ips"],
+            "artifacts_domains": artifacts["domains"],
+            "artifacts_urls": artifacts["urls"],
+            "artifacts_hashes": artifacts["hashes"],
+            "artifacts_registry": artifacts["registry"],
+        }
 
     # Embed combined text
     try:
@@ -196,13 +267,34 @@ def ingest(req: StructuredIngest):
 
     # Upsert into vector store and metadata DB
     doc_id = str(uuid.uuid4())
+    # Helper: serialize lists to compact comma-joined strings for Chroma metadata
+    def _meta_list(name: str, vals: list[str] | None, max_items: int = 20) -> dict:
+        v = (vals or [])
+        if not v:
+            return {}
+        joined = ", ".join(v[:max_items])
+        return {name: joined}
+
     metadata = {
         "source": req.source,
         "title": title,
         "problem": problem[:500],
         # New: persist raw code snippet in metadata for answer composition
         "code_snippet": (req.code_snippet.strip() if (req.code_snippet or "").strip() else None),
+        # New: include security metadata if provided (scalars only)
+        "ioc_type": (req.ioc_type.strip() if req.ioc_type else None),
+        "threat_level": (req.threat_level.strip() if req.threat_level else None),
+        "incident_type": (req.incident_type.strip() if req.incident_type else None),
+        # DO NOT spread sec_meta here (it contains lists)
     }
+
+    # Inject serialized artifacts (avoid list values in metadata)
+    metadata.update(_meta_list("artifacts_ips", sec_meta.get("artifacts_ips")))
+    metadata.update(_meta_list("artifacts_domains", sec_meta.get("artifacts_domains")))
+    metadata.update(_meta_list("artifacts_urls", sec_meta.get("artifacts_urls")))
+    metadata.update(_meta_list("artifacts_hashes", sec_meta.get("artifacts_hashes")))
+    metadata.update(_meta_list("artifacts_registry", sec_meta.get("artifacts_registry")))
+
     try:
         vs_upsert(id=doc_id, embedding=embedding, document=combined, metadata=metadata)
         upsert_document(doc_id, combined, metadata)
@@ -249,7 +341,10 @@ def ingest(req: StructuredIngest):
     return {"job_id": doc_id, "id": doc_id, "ok": True, "note_ids": note_ids}
 
 @app.post("/v1/query", response_model=QueryResponse)
-def query(req: QueryRequest):
+def query(req: QueryRequest, ioc_type: str | None = None, incident_type: str | None = None, threat_level: str | None = None):
+    # Example: POST /v1/query (JSON body + optional filters as query params)
+    # curl -s -X POST "http://localhost:8000/v1/query?incident_type=phishing&threat_level=high" \
+    #   -H "Content-Type: application/json" -d '{ "query":"session ttl", "k":5 }'
     # Call search with defensive handling
     try:
         search = post_json(
@@ -257,31 +352,41 @@ def query(req: QueryRequest):
             SearchRequest(query=req.query, k=req.k).model_dump()
         )
     except Exception as e:
-        # Upstream not reachable or error
         raise HTTPException(status_code=502, detail=f"Search service error: {e}")
 
     sr = SearchResponse(**search)
 
     # If no hits, return a friendly answer instead of failing
     if not sr.hits:
-        return QueryResponse(
-            answer="No results found. Try different keywords or ingest more content via /v1/ingest.",
-            hits=[]
-        )
+        return QueryResponse(answer="No results found. Try different keywords or ingest more content via /v1/ingest.", hits=[])
 
-    # New: filter by minimum score and keyword presence
+    # Filter by minimum score and keyword presence
     min_score = 0.25
     q_tokens = {t for t in req.query.lower().split() if len(t) > 2}
-    def passes(h):
+    def base_passes(h):
         text = (h.text or "").lower()
-        # basic token match: any query token present in text
         token_match = any(t in text for t in q_tokens) if q_tokens else True
         return h.score >= min_score and token_match
 
-    filtered_hits = [h for h in sr.hits if passes(h)]
+    # Security metadata filters (optional)
+    def sec_passes(h):
+        meta = h.metadata or {}
+        if ioc_type and (meta.get("ioc_type") or "").lower() != ioc_type.lower():
+            return False
+        if incident_type and (meta.get("incident_type") or "").lower() != incident_type.lower():
+            return False
+        if threat_level and (meta.get("threat_level") or "").lower() != threat_level.lower():
+            return False
+        return True
+
+    filtered_hits = [h for h in sr.hits if base_passes(h) and sec_passes(h)]
+
+    # Strict filtering: if nothing matches, do NOT fallback to top hit
     if not filtered_hits:
-        # fallback: keep only top hit if everything filtered out
-        filtered_hits = sr.hits[:1]
+        return QueryResponse(
+            answer="No results matched the applied filters. Try adjusting ioc_type, incident_type, or threat_level.",
+            hits=[]
+        )
 
     # Call renderer with defensive handling
     try:
@@ -298,6 +403,8 @@ def query(req: QueryRequest):
 # New: list notes for a given document id (provenance-aware)
 @app.get("/v1/notes/by_doc")
 def notes_by_doc(doc_id: str):
+    # Example: GET /v1/notes/by_doc?doc_id=abcd-1234
+    # curl -s "http://localhost:8000/v1/notes/by_doc?doc_id=abcd-1234"
     try:
         rows = list_notes_for_doc(doc_id=doc_id)
         return {"items": [
@@ -310,6 +417,9 @@ def notes_by_doc(doc_id: str):
 # Query decision notes only (filters hits with metadata.type == 'note')
 @app.post("/v1/query/notes", response_model=QueryResponse)
 def query_notes(req: QueryRequest):
+    # Example: POST /v1/query/notes
+    # curl -s -X POST http://localhost:8000/v1/query/notes \
+    #   -H "Content-Type: application/json" -d '{ "query":"deadlock tradeoffs", "k":5 }'
     try:
         search = post_json(
             f"{SEARCH_URL}/v1/search",
@@ -531,6 +641,10 @@ def _summarize_notes_inline(query: str) -> str | None:
 
 @app.post("/v1/answers/compose")
 def compose_answer(req: ComposeRequest):
+    # Example: POST /v1/answers/compose
+    # curl -s -X POST http://localhost:8000/v1/answers/compose \
+    #   -H "Content-Type: application/json" \
+    #   -d '{ "query":"phishing mitigation", "k":5, "include_notes":true }'
     # Search top-k
     try:
         search = post_json(
@@ -548,6 +662,9 @@ def compose_answer(req: ComposeRequest):
 
 @app.post("/v1/admin/clear")
 def admin_clear():
+    # Example: POST /v1/admin/clear
+    # curl -s -X POST http://localhost:8000/v1/admin/clear
+    # Response: { "ok": true, "cleared": { "documents": N, "decision_notes": M, ... } }
     # Clear SQLite tables
     cleared = {"documents": 0, "decision_notes": 0, "vector_collection_deleted": False, "vector_collection_recreated": False}
     try:
@@ -587,3 +704,10 @@ def admin_clear():
         raise HTTPException(status_code=500, detail=f"Vector store clear failed: {e}")
 
     return {"ok": True, "cleared": cleared}
+
+# Telemetry heatmap (if present)
+@app.get("/v1/telemetry/heatmap")
+def telemetry_heatmap(limit: int = 1000):
+    # Example: GET /v1/telemetry/heatmap?limit=500
+    # curl -s "http://localhost:8000/v1/telemetry/heatmap?limit=500"
+    pass  # ...existing code...
