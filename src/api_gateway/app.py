@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime
 
 from fastapi import FastAPI, Form, HTTPException
 from pydantic import BaseModel, Field
@@ -6,7 +7,8 @@ from pydantic import BaseModel, Field
 from src.common.config import (EMBEDDING_URL, INGESTION_URL, RENDERER_URL,
                                SEARCH_URL)
 from src.common.db import init_db  # ensure tables exist
-from src.common.db import upsert_document
+from src.common.db import (add_note, list_notes, list_notes_for_doc,
+                           search_notes_by_tag, upsert_document)
 from src.common.http import post_json
 from src.common.schemas import (EmbedRequest, EmbedResponse, QueryRequest,
                                 QueryResponse, RenderRequest, RenderResponse,
@@ -20,6 +22,56 @@ class StructuredIngest(BaseModel):
     problem: str = Field(..., min_length=1)
     solution: str = Field(..., min_length=1)
     source: str = Field(default="entry")
+    notes: list["DecisionNoteIn"] = Field(default_factory=list)
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "title": "Login fails on mobile",
+                    "problem": "Users cannot log in due to stale sessions on mobile devices.",
+                    "solution": "Reset session on login and rotate tokens; shorten mobile session TTL.",
+                    "source": "entry",
+                    "notes": [
+                        {
+                            "title": "Tradeoffs",
+                            "content": "Shorter TTL increases re-auth frequency; mitigated by MFA remember-device.",
+                            "kind": "ADR",
+                            "tags": ["auth","session","ttl"]
+                        },
+                        {
+                            "title": "Incident RCA",
+                            "content": "Batch job held locks causing session store delays; fixed by reducing transaction scope.",
+                            "kind": "Incident",
+                            "tags": ["ops","locks","session-store"]
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+
+# Add a decision note (ADR/Incident/RCA)
+class DecisionNoteIn(BaseModel):
+    title: str = Field(..., min_length=1)
+    content: str = Field(..., min_length=1)  # explanations, tradeoffs, root cause
+    kind: str = Field(default="ADR")
+    tags: list[str] = Field(default=[])
+    doc_id: str | None = None  # populated automatically when sent inside ingest
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "title": "DB deadlock tradeoffs",
+                    "content": "Retry logic can hide modeling issues; use shorter transactions and proper indexing.",
+                    "kind": "ADR",
+                    "tags": ["db","deadlock","transactions"]
+                }
+            ]
+        }
+    }
+
+# Pydantic forward reference resolution
+StructuredIngest.model_rebuild()
 
 app = FastAPI(title="API Gateway")
 
@@ -54,6 +106,63 @@ def status():
         "errors": errors,
     }
 
+@app.post("/v1/notes/add")
+def notes_add(req: DecisionNoteIn):
+    note_id = str(uuid.uuid4())
+    try:
+        add_note(
+            note_id=note_id,
+            title=req.title.strip(),
+            content=req.content.strip(),
+            kind=req.kind.strip(),
+            tags=[t.strip() for t in req.tags],
+            created_at=datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            doc_id=(req.doc_id.strip() if req.doc_id else None),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save note: {e}")
+    return {"id": note_id, "ok": True}
+
+@app.get("/v1/notes/list")
+def notes_list(limit: int = 20):
+    try:
+        rows = list_notes(limit=limit)
+        return {"items": [
+            {"id": r.id, "title": r.title, "kind": r.kind, "tags": r.tags or [], "created_at": r.created_at}
+            for r in rows
+        ]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list notes: {e}")
+
+@app.get("/v1/notes/search")
+def notes_search(tag: str, limit: int = 20):
+    try:
+        rows = search_notes_by_tag(tag=tag, limit=limit)
+        return {"items": [
+            {"id": r.id, "title": r.title, "kind": r.kind, "tags": r.tags or [], "created_at": r.created_at}
+            for r in rows
+        ]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to search notes: {e}")
+
+@app.get("/v1/notes/match")
+def notes_match(keyword: str, limit: int = 10):
+    try:
+        rows = match_notes(keyword=keyword, limit=limit)
+        return {"items": [
+            {
+                "id": r.id,
+                "title": r.title,
+                "kind": r.kind,
+                "tags": r.tags or [],
+                "created_at": r.created_at,
+                "snippet": (r.content[:200] + ("..." if len(r.content) > 200 else "")),
+            }
+            for r in rows
+        ]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to match notes: {e}")
+
 @app.post("/v1/ingest")
 def ingest(req: StructuredIngest):
     # Validate and normalize
@@ -87,7 +196,26 @@ def ingest(req: StructuredIngest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Indexing error: {e}")
 
-    return {"job_id": doc_id, "id": doc_id, "ok": True}
+    # New: save any provided notes and link them to this document
+    note_ids: list[str] = []
+    for n in (req.notes or []):
+        nid = str(uuid.uuid4())
+        try:
+            add_note(
+                note_id=nid,
+                title=n.title.strip(),
+                content=n.content.strip(),
+                kind=(n.kind or "ADR").strip(),
+                tags=[t.strip() for t in (n.tags or [])],
+                created_at=datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                doc_id=doc_id,
+            )
+            note_ids.append(nid)
+        except Exception as e:
+            # continue saving other notes, but report partial failure
+            note_ids.append(f"error:{e}")
+
+    return {"job_id": doc_id, "id": doc_id, "ok": True, "note_ids": note_ids}
 
 @app.post("/v1/query", response_model=QueryResponse)
 def query(req: QueryRequest):
@@ -135,3 +263,15 @@ def query(req: QueryRequest):
 
     rr = RenderResponse(**render)
     return QueryResponse(answer=rr.answer, hits=filtered_hits)
+
+# New: list notes for a given document id (provenance-aware)
+@app.get("/v1/notes/by_doc")
+def notes_by_doc(doc_id: str):
+    try:
+        rows = list_notes_for_doc(doc_id=doc_id)
+        return {"items": [
+            {"id": r.id, "title": r.title, "kind": r.kind, "tags": r.tags or [], "created_at": r.created_at}
+            for r in rows
+        ]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list notes for doc: {e}")
