@@ -1063,6 +1063,91 @@ def _summarize_notes_inline(query: str) -> str | None:
     kinds_str = ", ".join([f"{k}:{v}" for k, v in kinds.items()])
     return f"Previously, you had {count} notes related to '{' '.join(kws)}' ({kinds_str}).\n" + "\n".join(bullets)
 
+def _compose_insights(query: str, hits: list, notes_summary: str | None) -> str:
+    # Aggregate actionable insights across all non-note hits, plus linked notes
+    actions, risks, indicators, guidance = [], [], [], []
+    seen = set()
+
+    def add_unique(lst, text, max_len=200):
+        t = (_clean_snippet(text, max_len) if text else "").strip()
+        if t and t.lower() not in seen:
+            lst.append(f"- {t}")
+            seen.add(t.lower())
+
+    # Indicators from metadata across hits
+    for h in hits or []:
+        meta = h.metadata or {}
+        for key in ("artifacts_ips", "artifacts_domains", "artifacts_urls", "artifacts_hashes", "artifacts_registry"):
+            val = (meta.get(key) or "").strip()
+            if val:
+                add_unique(indicators, f"{key.replace('artifacts_', '').title()}: {val}", max_len=160)
+        # Enrichment quick context
+        for key in ("vt_hash_reputation", "abuseipdb_ip_score", "urlhaus_signature"):
+            val = (meta.get(key) or "").strip()
+            if val:
+                add_unique(indicators, f"{key.replace('_', ' ').title()}: {val}", max_len=160)
+
+        # Guidance from problem and code snippet
+        prob = (meta.get("problem") or "").strip()
+        code = (meta.get("code_snippet") or "").strip()
+        if prob:
+            add_unique(guidance, f"Context: {prob}", max_len=200)
+        if code:
+            add_unique(guidance, f"Suggested snippet: {code}", max_len=220)
+
+        # Basic actions from incident context
+        inc = (meta.get("incident_type") or "").strip()
+        if inc:
+            add_unique(actions, f"Mitigate {inc}: contain source, block indicators, and monitor for recurrence.", max_len=200)
+
+        # Risks from threat level
+        thr = (meta.get("threat_level") or "").strip().lower()
+        if thr == "high":
+            add_unique(risks, "High threat: prioritize containment, IR, and executive visibility.", max_len=200)
+        elif thr == "medium":
+            add_unique(risks, "Medium threat: schedule remediation and add detection rules.", max_len=200)
+
+        # Linked notes (if renderer/search added related_notes)
+        for n in (meta.get("related_notes") or []):
+            kind = (n.get("kind") or "").lower()
+            title = (n.get("title") or "").strip()
+            text = (n.get("text") or "").strip()
+            snippet = _clean_snippet(text, 200)
+            if kind == "adr":
+                add_unique(actions, f"Tradeoff – {title}: {snippet}" if snippet else f"Tradeoff – {title}")
+            elif kind in ("incident", "rca", "bug rca"):
+                add_unique(risks, f"Incident – {title}: {snippet}" if snippet else f"Incident – {title}")
+            else:
+                add_unique(guidance, f"Note – {title}: {snippet}" if snippet else f"Note – {title}")
+
+    # Use notes_summary (if any) to supplement guidance
+    if notes_summary:
+        for b in _to_bullets(notes_summary, max_items=3, max_item_len=160):
+            add_unique(guidance, b, max_len=160)
+
+    # Limit each section
+    actions = actions[:6] or ["- No concrete actions found."]
+    risks = risks[:6] or ["- No explicit risks found."]
+    indicators = indicators[:8] or ["- No indicators extracted."]
+    guidance = guidance[:6] or ["- No additional guidance."]
+
+    header = f"Insights for: {query.strip()}" if (query or "").strip() else "Insights"
+    return "\n".join([
+        header,
+        "",
+        "Key Actions",
+        *actions,
+        "",
+        "Risks & Considerations",
+        *risks,
+        "",
+        "Indicators & Intel",
+        *indicators,
+        "",
+        "Operational Guidance",
+        *guidance,
+    ])
+
 @app.post("/v1/answers/compose")
 def compose_answer(req: ComposeRequest):
     # Example: POST /v1/answers/compose
@@ -1098,11 +1183,14 @@ def compose_answer(req: ComposeRequest):
     hits = [h for h in safe_hits if (h.score or 0.0) >= min_score]
 
     notes_summary = _summarize_notes_inline(req.query) if req.include_notes else None
-    answer = _compose_blocks(req.query, hits, notes_summary)
 
-    # New: return only non-note hits meeting the score threshold
+    # New: produce aggregated insights, then append structured blocks for completeness
+    insights = _compose_insights(req.query, hits, notes_summary)
+    blocks = _compose_blocks(req.query, hits, notes_summary)
+
+    # Return insights first; hits include only non-note entries
     non_note_hits = [h for h in hits if ((h.metadata or {}).get("type") or "").lower() != "note"]
-    return {"answer": answer, "hits": [h.model_dump() for h in non_note_hits]}
+    return {"answer": f"{insights}\n\n{blocks}", "hits": [h.model_dump() for h in non_note_hits]}
 
 @app.post("/v1/admin/clear")
 def admin_clear():
