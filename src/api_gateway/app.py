@@ -201,6 +201,7 @@ def ingest(req: StructuredIngest):
     for n in (req.notes or []):
         nid = str(uuid.uuid4())
         try:
+            # Save note to metadata DB
             add_note(
                 note_id=nid,
                 title=n.title.strip(),
@@ -210,9 +211,26 @@ def ingest(req: StructuredIngest):
                 created_at=datetime.utcnow().isoformat(timespec="seconds") + "Z",
                 doc_id=doc_id,
             )
+            # Embed and index the note for search
+            note_text = f"Note: {n.title.strip()}\n{n.content.strip()}"
+            emb_note = post_json(f"{EMBEDDING_URL}/v1/embed", EmbedRequest(texts=[note_text]).model_dump())
+            er_note = EmbedResponse(**emb_note)
+            vs_upsert(
+                id=nid,
+                embedding=er_note.embeddings[0],
+                document=note_text,
+                metadata={
+                    "type": "note",
+                    "note_kind": (n.kind or "ADR").strip(),
+                    "title": n.title.strip(),
+                    "doc_id": doc_id,
+                    "source": "note",
+                    # New: include a snippet of the note content for filtering/display
+                    "content_snippet": (n.content.strip()[:500])
+                }
+            )
             note_ids.append(nid)
         except Exception as e:
-            # continue saving other notes, but report partial failure
             note_ids.append(f"error:{e}")
 
     return {"job_id": doc_id, "id": doc_id, "ok": True, "note_ids": note_ids}
@@ -275,3 +293,48 @@ def notes_by_doc(doc_id: str):
         ]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to list notes for doc: {e}")
+
+# Query decision notes only (filters hits with metadata.type == 'note')
+@app.post("/v1/query/notes", response_model=QueryResponse)
+def query_notes(req: QueryRequest):
+    try:
+        search = post_json(
+            f"{SEARCH_URL}/v1/search",
+            SearchRequest(query=req.query, k=req.k).model_dump()
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Search service error: {e}")
+
+    sr = SearchResponse(**search)
+    note_hits = [h for h in sr.hits if (h.metadata or {}).get("type") == "note"]
+
+    if not note_hits:
+        return QueryResponse(
+            answer="No decision notes found. Try different keywords or add notes via /v1/notes/add or in /v1/ingest.",
+            hits=[]
+        )
+
+    # Filter using both vector text and metadata content_snippet
+    min_score = 0.20
+    q_tokens = {t for t in req.query.lower().split() if len(t) > 2}
+    def passes(h):
+        text = (h.text or "").lower()
+        meta = h.metadata or {}
+        content_meta = (meta.get("content_snippet", "") or "").lower()
+        token_match_text = any(t in text for t in q_tokens) if q_tokens else True
+        token_match_meta = any(t in content_meta for t in q_tokens) if q_tokens else True
+        token_match = token_match_text or token_match_meta
+        return h.score >= min_score and token_match
+
+    filtered = [h for h in note_hits if passes(h)] or note_hits[:1]
+
+    try:
+        render = post_json(
+            f"{RENDERER_URL}/v1/render",
+            RenderRequest(query=req.query, hits=filtered).model_dump()
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Renderer service error: {e}")
+
+    rr = RenderResponse(**render)
+    return QueryResponse(answer=rr.answer, hits=filtered)
