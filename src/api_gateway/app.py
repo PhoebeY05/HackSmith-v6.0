@@ -600,28 +600,63 @@ def query(req: QueryRequest, ioc_type: str | None = None, incident_type: str | N
             enriched.append(h)
         return enriched
 
-    # New: if query is empty, list all non-note entries (apply security filters only)
-    if not (req.query or "").strip():
-        def sec_passes_empty(h):
-            meta = h.metadata or {}
-            if ioc_type and (meta.get("ioc_type") or "").lower() != ioc_type.lower():
+    # New: list recent non-note documents directly from DB (apply optional filters)
+    def _list_all_docs(limit: int = 100) -> list:
+        try:
+            with SessionLocal() as s:
+                rows = s.execute(
+                    sa_text("SELECT id, content, metadata FROM documents ORDER BY rowid DESC LIMIT :n"),
+                    {"n": limit}
+                ).fetchall()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to read documents: {e}")
+
+        def _sec_passes_meta(meta: dict) -> bool:
+            m = meta or {}
+            if ioc_type and (m.get("ioc_type") or "").lower() != ioc_type.lower():
                 return False
-            if incident_type and (meta.get("incident_type") or "").lower() != incident_type.lower():
+            if incident_type and (m.get("incident_type") or "").lower() != incident_type.lower():
                 return False
-            if threat_level and (meta.get("threat_level") or "").lower() != threat_level.lower():
+            if threat_level and (m.get("threat_level") or "").lower() != threat_level.lower():
                 return False
             return True
-        non_note_hits = [h for h in (sr.hits or []) if ((h.metadata or {}).get("type") or "").lower() != "note"]
-        filtered_hits = [h for h in non_note_hits if sec_passes_empty(h)]
-        if not filtered_hits:
-            return QueryResponse(answer="No non-note entries found for the empty query.", hits=[])
-        # Use helper (now defined above)
-        filtered_hits = _attach_related_notes(filtered_hits)
-        return QueryResponse(answer="Listing all entries (non-note).", hits=filtered_hits)
 
-    # If no hits, return a friendly answer instead of failing
-    if not sr.hits:
-        return QueryResponse(answer="No results found. Try different keywords or ingest more content via /v1/ingest.", hits=[])
+        hits = []
+        for doc_id, content, meta in rows:
+            # Normalize metadata from DB: it can be a dict, a JSON string, or None
+            if isinstance(meta, dict):
+                m = meta
+            elif isinstance(meta, str):
+                try:
+                    m = json.loads(meta) if meta.strip() else {}
+                except Exception:
+                    m = {}
+            else:
+                m = {}
+
+            # skip explicit notes (defensive; notes are stored in decision_notes, but keep guard)
+            if (m.get("type") or "").lower() == "note":
+                continue
+            if not _sec_passes_meta(m):
+                continue
+            # Build a SearchHit-compatible dict
+            hits.append(
+                SearchResponse.model_fields["hits"].annotation.__args__[0](
+                    id=doc_id,
+                    text=(content or ""),
+                    score=1.0,
+                    metadata=m
+                )
+            )
+        return hits
+
+    # Empty query: return all docs from DB with filters, then enrich with related notes
+    if not (req.query or "").strip():
+        all_hits = _list_all_docs(limit=100)
+        if not all_hits:
+            return QueryResponse(answer="No non-note entries found for the empty query.", hits=[])
+        all_hits = _attach_related_notes(all_hits)
+        return QueryResponse(answer="Listing recent entries from the database (non-note).", hits=all_hits)
 
     # Filter by minimum score and keyword presence
     min_score = 0.25
@@ -1151,4 +1186,85 @@ def docs_delete(id: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete document: {e}")
+
+@app.post("/v1/admin/seed")
+def admin_seed():
+    # Seed cybersecurity-related documents with linked notes (50 entries),
+    # using the exact same path as /v1/ingest to ensure embeddings/metadata/indexing are consistent.
+    seeds = []
+    ioc_types = ["domain", "ip", "url", "hash", "registry"]
+    incident_types = ["phishing", "malware", "misconfiguration", "vuln", "phishing"]
+    threat_levels = ["low", "medium", "high"]
+    domains = [f"login-secure-{i}.co" for i in range(1, 21)]
+    ips = [f"45.83.64.{i}" for i in range(10, 30)]
+    urls = [f"https://bad-example{i}.co/payload" for i in range(1, 21)]
+    hashes = [f"{i:064x}"[:64] for i in range(1, 21)]
+    registries = [r"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run\Updater" for _ in range(1, 21)]
+
+    def _mk_notes(idx: int, topic: str):
+        return [
+            {"title": f"Tradeoffs #{idx}: Response hardening", "content": "Tight policies may break legacy dependencies; phase rollout and whitelist trusted apps.", "kind": "ADR", "tags": ["ops","security", topic, "tradeoffs"]},
+            {"title": f"Incident RCA #{idx}", "content": "Root cause tied to user behavior and missing detections; improve awareness and detections.", "kind": "Incident", "tags": ["ops","security", topic, "rca"]}
+        ]
+
+    for i in range(50):
+        ioc = ioc_types[i % len(ioc_types)]
+        inc = incident_types[i % len(incident_types)]
+        thr = threat_levels[i % len(threat_levels)]
+        title = f"[Seed #{i+1}] {inc.title()} event with {ioc.upper()} indicators"
+        problem = f"Detection #{i+1}: Observed suspicious activity tied to {ioc} indicators during {inc}."
+        if ioc == "domain":
+            dom = domains[i % len(domains)]
+            code_snippet = f"Suspicious domain: {dom}\nLogin page lookalike reported by users."
+        elif ioc == "ip":
+            ip = ips[i % len(ips)]
+            code_snippet = f"Beacon IP: {ip}\nFirewall logs show repeated outbound connections."
+        elif ioc == "url":
+            u = urls[i % len(urls)]
+            code_snippet = f"Malicious URL: {u}\nEDR flagged download attempts."
+        elif ioc == "hash":
+            h = hashes[i % len(hashes)]
+            code_snippet = f"Artifact hash: {h}\nObserved in endpoint telemetry."
+        else:
+            reg = registries[i % len(registries)]
+            code_snippet = f"Persistence key: {reg}\nAutorun entry added by unknown binary."
+
+        solution = "Contain, block indicators, and remediate; add detection rules and improve user awareness."
+        notes = _mk_notes(i+1, ioc)
+
+        # Use source="entry" to mirror normal ingest payloads
+        seeds.append({
+            "title": title,
+            "problem": problem,
+            "solution": solution,
+            "source": "entry",
+            "ioc_type": ioc,
+            "threat_level": thr,
+            "incident_type": inc,
+            "code_snippet": code_snippet,
+            "notes": notes
+        })
+
+    created = []
+    for item in seeds:
+        try:
+            # Build StructuredIngest exactly like normal ingest usage
+            req = StructuredIngest(
+                title=item["title"],
+                problem=item["problem"],
+                solution=item["solution"],
+                source=item["source"],  # "entry"
+                code_snippet=item.get("code_snippet"),
+                ioc_type=item.get("ioc_type"),
+                threat_level=item.get("threat_level"),
+                incident_type=item.get("incident_type"),
+                notes=[DecisionNoteIn(**n) for n in (item.get("notes") or [])],
+            )
+            # Call ingest() so embeddings, metadata, artifacts, and notes are processed identically
+            resp = ingest(req)
+            created.append({"id": resp["id"], "note_ids": resp["note_ids"]})
+        except Exception as e:
+            created.append({"error": str(e)})
+
+    return {"ok": True, "seeded": len(created), "items": created}
 
