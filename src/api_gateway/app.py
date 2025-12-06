@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime
 
 from fastapi import FastAPI, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import text as sa_text
 
@@ -88,6 +89,14 @@ class DecisionNoteIn(BaseModel):
 StructuredIngest.model_rebuild()
 
 app = FastAPI(title="API Gateway")
+# Enable CORS for frontend dev
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=False,
+)
 
 # Endpoint I/O summary
 # /v1/ingest
@@ -549,6 +558,23 @@ def query(req: QueryRequest, ioc_type: str | None = None, incident_type: str | N
         raise HTTPException(status_code=502, detail=f"Search service error: {e}")
 
     sr = SearchResponse(**search)
+
+    # New: if query is empty, list all non-note entries (apply security filters only)
+    if not (req.query or "").strip():
+        def sec_passes_empty(h):
+            meta = h.metadata or {}
+            if ioc_type and (meta.get("ioc_type") or "").lower() != ioc_type.lower():
+                return False
+            if incident_type and (meta.get("incident_type") or "").lower() != incident_type.lower():
+                return False
+            if threat_level and (meta.get("threat_level") or "").lower() != threat_level.lower():
+                return False
+            return True
+        non_note_hits = [h for h in (sr.hits or []) if ((h.metadata or {}).get("type") or "").lower() != "note"]
+        filtered_hits = [h for h in non_note_hits if sec_passes_empty(h)]
+        if not filtered_hits:
+            return QueryResponse(answer="No non-note entries found for the empty query.", hits=[])
+        return QueryResponse(answer="Listing all entries (non-note).", hits=filtered_hits)
 
     # If no hits, return a friendly answer instead of failing
     if not sr.hits:
