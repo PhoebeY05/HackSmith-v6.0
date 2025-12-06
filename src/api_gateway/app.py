@@ -110,14 +110,28 @@ def query(req: QueryRequest):
             hits=[]
         )
 
+    # New: filter by minimum score and keyword presence
+    min_score = 0.25
+    q_tokens = {t for t in req.query.lower().split() if len(t) > 2}
+    def passes(h):
+        text = (h.text or "").lower()
+        # basic token match: any query token present in text
+        token_match = any(t in text for t in q_tokens) if q_tokens else True
+        return h.score >= min_score and token_match
+
+    filtered_hits = [h for h in sr.hits if passes(h)]
+    if not filtered_hits:
+        # fallback: keep only top hit if everything filtered out
+        filtered_hits = sr.hits[:1]
+
     # Call renderer with defensive handling
     try:
         render = post_json(
             f"{RENDERER_URL}/v1/render",
-            RenderRequest(query=req.query, hits=sr.hits).model_dump()
+            RenderRequest(query=req.query, hits=filtered_hits).model_dump()
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Renderer service error: {e}")
 
     rr = RenderResponse(**render)
-    return QueryResponse(answer=rr.answer, hits=sr.hits)
+    return QueryResponse(answer=rr.answer, hits=filtered_hits)
