@@ -582,6 +582,24 @@ def query(req: QueryRequest, ioc_type: str | None = None, incident_type: str | N
         safe_hits.append(h)
     sr.hits = safe_hits
 
+    # New: define helper BEFORE any branch uses it
+    def _attach_related_notes(hs: list) -> list:
+        enriched = []
+        for h in hs or []:
+            meta = h.metadata or {}
+            if ((meta.get("type") or "").lower() != "note") and h.id:
+                try:
+                    rows = list_notes_for_doc(doc_id=h.id)
+                    meta["related_notes"] = [
+                        {"id": r.id, "title": r.title, "kind": r.kind, "created_at": r.created_at}
+                        for r in rows
+                    ]
+                    h.metadata = meta
+                except Exception:
+                    pass
+            enriched.append(h)
+        return enriched
+
     # New: if query is empty, list all non-note entries (apply security filters only)
     if not (req.query or "").strip():
         def sec_passes_empty(h):
@@ -597,6 +615,8 @@ def query(req: QueryRequest, ioc_type: str | None = None, incident_type: str | N
         filtered_hits = [h for h in non_note_hits if sec_passes_empty(h)]
         if not filtered_hits:
             return QueryResponse(answer="No non-note entries found for the empty query.", hits=[])
+        # Use helper (now defined above)
+        filtered_hits = _attach_related_notes(filtered_hits)
         return QueryResponse(answer="Listing all entries (non-note).", hits=filtered_hits)
 
     # If no hits, return a friendly answer instead of failing
@@ -630,6 +650,9 @@ def query(req: QueryRequest, ioc_type: str | None = None, incident_type: str | N
             answer="No results matched the applied filters. Try adjusting ioc_type, incident_type, or threat_level.",
             hits=[]
         )
+
+    # Attach related notes
+    filtered_hits = _attach_related_notes(filtered_hits)
 
     # Call renderer with defensive handling
     try:
