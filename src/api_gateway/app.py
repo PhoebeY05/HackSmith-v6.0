@@ -3,16 +3,20 @@ from datetime import datetime
 
 from fastapi import FastAPI, Form, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy import text as sa_text
 
-from src.common.config import (EMBEDDING_URL, INGESTION_URL, RENDERER_URL,
-                               SEARCH_URL)
+from src.common.config import (CHROMA_PATH, COLLECTION_NAME, EMBEDDING_URL,
+                               INGESTION_URL, RENDERER_URL, SEARCH_URL)
+# Add import for note matching used by the summarizer
 from src.common.db import init_db  # ensure tables exist
-from src.common.db import (add_note, list_notes, list_notes_for_doc,
+from src.common.db import (SessionLocal, add_note, list_notes,
+                           list_notes_for_doc, match_notes,
                            search_notes_by_tag, upsert_document)
 from src.common.http import post_json
 from src.common.schemas import (EmbedRequest, EmbedResponse, QueryRequest,
                                 QueryResponse, RenderRequest, RenderResponse,
                                 SearchRequest, SearchResponse)
+from src.common.vector_store import get_client  # use shared client
 from src.common.vector_store import upsert as vs_upsert
 
 
@@ -23,6 +27,8 @@ class StructuredIngest(BaseModel):
     solution: str = Field(..., min_length=1)
     source: str = Field(default="entry")
     notes: list["DecisionNoteIn"] = Field(default_factory=list)
+    # New: optional code snippet to support copy-ready blocks
+    code_snippet: str | None = Field(default=None, description="Optional code snippet relevant to the solution")
     model_config = {
         "json_schema_extra": {
             "examples": [
@@ -31,6 +37,7 @@ class StructuredIngest(BaseModel):
                     "problem": "Users cannot log in due to stale sessions on mobile devices.",
                     "solution": "Reset session on login and rotate tokens; shorten mobile session TTL.",
                     "source": "entry",
+                    "code_snippet": "useEffect(() => { rotateTokens(); resetSession(); }, []);",
                     "notes": [
                         {
                             "title": "Tradeoffs",
@@ -174,6 +181,10 @@ def ingest(req: StructuredIngest):
 
     # Build combined searchable text
     combined = f"Title: {title}\nProblem: {problem}\nSolution: {solution}"
+    # New: optionally include a trimmed code snippet to improve retrieval (kept short to avoid noise)
+    if (req.code_snippet or "").strip():
+        snippet_trim = _clean_snippet(req.code_snippet.strip(), max_len=300)
+        combined += f"\nCode:\n{snippet_trim}"
 
     # Embed combined text
     try:
@@ -189,6 +200,8 @@ def ingest(req: StructuredIngest):
         "source": req.source,
         "title": title,
         "problem": problem[:500],
+        # New: persist raw code snippet in metadata for answer composition
+        "code_snippet": (req.code_snippet.strip() if (req.code_snippet or "").strip() else None),
     }
     try:
         vs_upsert(id=doc_id, embedding=embedding, document=combined, metadata=metadata)
@@ -338,3 +351,239 @@ def query_notes(req: QueryRequest):
 
     rr = RenderResponse(**render)
     return QueryResponse(answer=rr.answer, hits=filtered)
+
+# Helpers: clean snippet and compose neat answer blocks
+def _clean_snippet(text: str, max_len: int = 600) -> str:
+    if not text:
+        return ""
+    s = text.strip()
+    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+    s = " ".join(lines)  # flatten
+    return (s[:max_len].rstrip() + ("..." if len(s) > max_len else ""))
+
+def _safe_title(meta: dict, fallback: str) -> str:
+    title = (meta or {}).get("title") or fallback or "Reference"
+    return title.strip()
+
+def _is_tradeoff(meta: dict, title: str) -> bool:
+    t = (title or "").lower()
+    kind = (meta or {}).get("note_kind", "").lower()
+    return ("tradeoff" in t) or ((meta or {}).get("type") == "note" and kind == "adr")
+
+def _is_incident(meta: dict, title: str) -> bool:
+    t = (title or "").lower()
+    kind = (meta or {}).get("note_kind", "").lower()
+    return ("incident" in t) or ("rca" in t) or ((meta or {}).get("type") == "note" and kind in ("incident", "bug rca", "rca"))
+
+def _is_warning_or_ops(meta: dict, text: str) -> bool:
+    s = (text or "").lower()
+    return ("warning" in s) or ("caveat" in s) or ("operations" in s) or ("ops" in s)
+
+# New: define bulletization helper before usage in _compose_blocks
+def _to_bullets(text: str, max_items: int = 5, max_item_len: int = 160) -> list[str]:
+    if not text:
+        return []
+    import re
+    parts = [p.strip() for p in re.split(r"[.!?;]\s+|\n+", text) if p.strip()]
+    bullets, seen = [], set()
+    for p in parts:
+        p = p[:max_item_len].strip()
+        if p and p not in seen and len(p) >= 3:
+            bullets.append(p)
+            seen.add(p)
+        if len(bullets) >= max_items:
+            break
+    return bullets
+
+def _compose_blocks(query: str, hits: list, notes_summary: str | None) -> str:
+    # Pick the first non-note hit for Problem and Solution sections
+    def _first_non_note(hs: list):
+        for h in hs or []:
+            meta = h.metadata or {}
+            if (meta.get("type") or "").lower() != "note":
+                return h
+        return None
+
+    primary = _first_non_note(hits)
+    primary_meta = (primary.metadata if primary else {}) or {}
+
+    # Section 1: Problem Addressed (prefer primary doc metadata.problem; fallback to query)
+    problem_text = (primary_meta.get("problem") or query or "").strip()
+    problem_section = "Problem Addressed\n- " + problem_text
+
+    # Section 2: Solution (exclude notes entirely)
+    solution_text = (primary_meta.get("code_snippet") or "")
+    solution_section = "Code Snippet"
+    if solution_text:
+        solution_section += "\n" + _clean_snippet(solution_text.strip(), max_len=280)
+    else:
+        solution_section += "\n- No direct fix found. Refine the query or ingest more content."
+
+    # Section 3: Tradeoffs (ADR + tradeoff-like hits + tradeoff text from notes_summary)
+    tradeoffs_section = "Tradeoffs"
+    tradeoff_bullets = _to_bullets(notes_summary or "", max_items=5, max_item_len=160)
+    for h in hits[:6]:
+        meta = h.metadata or {}
+        title = _safe_title(meta, (h.text.splitlines()[0][:50] if h.text else ""))
+        if _is_tradeoff(meta, title):
+            snippet = _clean_snippet(h.text, 200)
+            for b in _to_bullets(snippet, max_items=2, max_item_len=160):
+                if b not in tradeoff_bullets:
+                    tradeoff_bullets.append(b)
+    tradeoff_bullets = tradeoff_bullets[:5]
+    if tradeoff_bullets:
+        for b in tradeoff_bullets:
+            tradeoffs_section += f"\n- {b}"
+    else:
+        tradeoffs_section += "\n- No prior tradeoffs found. Consider adding ADR notes."
+
+    # Section 4: Other Considerations (incidents/RCA, ops/warnings, non-tradeoff references)
+    other_section = "Other Considerations"
+    seen_titles = set()
+    other_items = []
+    for h in hits[:8]:
+        meta = h.metadata or {}
+        title = _safe_title(meta, (h.text.splitlines()[0][:50] if h.text else ""))
+        key = title.lower()
+        if key in seen_titles:
+            continue
+        seen_titles.add(key)
+        # Skip tradeoff items; collect incidents/rca/warnings/ops or general refs
+        if _is_tradeoff(meta, title):
+            continue
+        snippet = _clean_snippet(h.text, 200)
+        if _is_incident(meta, title) or _is_warning_or_ops(meta, h.text):
+            other_items.append(f"- {title} (score: {h.score:.3f})\n  {snippet}")
+        else:
+            # keep concise general references, avoid very short/vague snippets
+            if len(snippet) >= 20:
+                other_items.append(f"- {title} (score: {h.score:.3f})\n  {snippet}")
+    # Cap and render
+    if other_items:
+        other_section += "\n" + "\n".join(other_items[:6])
+    else:
+        other_section += "\n- No additional considerations."
+
+    # Final composition
+    return "\n\n".join([
+        problem_section.strip(),
+        solution_section.strip(),
+        tradeoffs_section.strip(),
+        other_section.strip()
+    ])
+
+# New: JSON request model for compose endpoint
+class ComposeRequest(BaseModel):
+    query: str = Field(..., min_length=1)
+    k: int = Field(default=5, ge=1, le=50)
+    include_notes: bool = True
+    # No change needed; compose reads stored code snippet from metadata
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {"query": "phishing mitigation", "k": 5, "include_notes": True},
+                {"query": "db deadlock retries", "k": 8, "include_notes": True},
+                {"query": "session ttl login", "k": 3, "include_notes": False}
+            ]
+        }
+    }
+
+def _extract_keywords(q: str) -> list[str]:
+    import re
+    toks = re.findall(r"[a-z0-9]{3,}", (q or "").lower())
+    out, seen = [], set()
+    for t in toks:
+        if t not in seen:
+            out.append(t); seen.add(t)
+    return out[:5]
+
+def _summarize_notes_inline(query: str) -> str | None:
+    # Summarize decision notes related to the query
+    kws = _extract_keywords(query)
+    matched = []
+    for kw in kws:
+        try:
+            rows = match_notes(keyword=kw, limit=10)
+            matched.extend(rows)
+        except Exception:
+            continue
+    if not matched:
+        return None
+    # Dedup by id
+    uniq = {}
+    for r in matched:
+        uniq.setdefault(r.id, r)
+    items = list(uniq.values())
+    count = len(items)
+    kinds = {}
+    for r in items:
+        kinds[r.kind] = kinds.get(r.kind, 0) + 1
+    # Build short bullets from content
+    bullets = []
+    for r in items[:3]:
+        content = (r.content or "").strip()
+        lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+        snippet = " ".join(lines[:2])[:240] if lines else content[:240]
+        bullets.append(f"- {r.title}: {snippet}")
+    kinds_str = ", ".join([f"{k}:{v}" for k, v in kinds.items()])
+    return f"Previously, you had {count} notes related to '{' '.join(kws)}' ({kinds_str}).\n" + "\n".join(bullets)
+
+@app.post("/v1/answers/compose")
+def compose_answer(req: ComposeRequest):
+    # Search top-k
+    try:
+        search = post_json(
+            f"{SEARCH_URL}/v1/search",
+            SearchRequest(query=req.query, k=req.k).model_dump()
+        )
+        sr = SearchResponse(**search)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Search service error: {e}")
+
+    hits = sr.hits or []
+    notes_summary = _summarize_notes_inline(req.query) if req.include_notes else None
+    answer = _compose_blocks(req.query, hits, notes_summary)
+    return {"answer": answer, "hits": [h.model_dump() for h in hits]}
+
+@app.post("/v1/admin/clear")
+def admin_clear():
+    # Clear SQLite tables
+    cleared = {"documents": 0, "decision_notes": 0, "vector_collection_deleted": False, "vector_collection_recreated": False}
+    try:
+        with SessionLocal() as s:
+            # Count before delete
+            docs_before = s.execute(sa_text("SELECT COUNT(*) FROM documents")).scalar() or 0
+            notes_before = 0
+            try:
+                notes_before = s.execute(sa_text("SELECT COUNT(*) FROM decision_notes")).scalar() or 0
+            except Exception:
+                notes_before = 0  # table may not exist yet
+            s.execute(sa_text("DELETE FROM documents"))
+            try:
+                s.execute(sa_text("DELETE FROM decision_notes"))
+            except Exception:
+                pass
+            s.commit()
+            cleared["documents"] = int(docs_before)
+            cleared["decision_notes"] = int(notes_before)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB clear failed: {e}")
+
+    # Clear Chroma collection using the shared client to avoid settings conflicts
+    try:
+        client = get_client()  # shared PersistentClient with consistent settings
+        # Delete collection if present
+        try:
+            client.delete_collection(COLLECTION_NAME)
+            cleared["vector_collection_deleted"] = True
+        except Exception:
+            # If not exists, ignore
+            pass
+        # Recreate collection with the same metadata used elsewhere
+        client.get_or_create_collection(name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
+        cleared["vector_collection_recreated"] = True
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Vector store clear failed: {e}")
+
+    return {"ok": True, "cleared": cleared}
